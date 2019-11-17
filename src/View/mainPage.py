@@ -43,9 +43,10 @@ class Ui_MainWindow(object):
 
         self.rxdose = 1
         if self.dataset['rtplan']:
-            if 'DoseReferenceSequence' in self.dataset['rtplan']:
-                if self.dataset['rtplan'].DoseReferenceSequence[0].DoseReferenceStructureType:
-                    self.rxdose = self.dataset['rtplan'].DoseReferenceSequence[0].TargetPrescriptionDose * 100
+            if ('DoseReferenceSequence' in self.dataset['rtplan'] and
+                self.dataset['rtplan'].DoseReferenceSequence[0].DoseReferenceStructureType and
+                self.dataset['rtplan'].DoseReferenceSequence[0].TargetPrescriptionDose ):
+                self.rxdose = self.dataset['rtplan'].DoseReferenceSequence[0].TargetPrescriptionDose * 100
             elif self.dataset['rtplan'].FractionGroupSequence:
                 fraction_group = self.dataset['rtplan'].FractionGroupSequence[0]
                 if ("NumberOfFractionsPlanned" in fraction_group) and \
