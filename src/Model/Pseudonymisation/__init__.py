@@ -112,18 +112,29 @@ def _is_known_tag(tag: pydicom.tag.BaseTag) -> bool:
     return tag in datadict.DicomDictionary or bool(datadict.mask_match(tag))
 
 
-def unknown_tags(ds: pydicom.Dataset) -> list[pydicom.tag.BaseTag]:
-    """Return the top-level public tags of ``ds`` that pydicom's data dictionary does not know.
+def unknown_tags(ds: pydicom.Dataset, path: tuple[str, ...] = ()) -> list[str]:
+    """Return where each public element of ``ds`` that pydicom's data dictionary does not know sits.
+
+    Sequence items are searched too, and so is the file meta of ``ds``: an unknown element
+    is not pseudonymised wherever it is, so it may carry identifying data into the output.
+    pymedphys checked only the top level. Each entry is the tag, prefixed by the sequences
+    and items leading to it, e.g. ``ReferencedStudySequence[0] > (0012,0099)``.
 
     Retired group length elements (element 0 of groups above 6) are ignored, as in pymedphys.
     """
-    return [
-        elem.tag
-        for elem in ds
-        if not elem.tag.is_private
-        and not (elem.tag.element == 0 and elem.tag.group > 6)
-        and not _is_known_tag(elem.tag)
-    ]
+    found = []
+    for elem in ds:
+        if elem.tag.is_private:
+            continue
+        if not (elem.tag.element == 0 and elem.tag.group > 6) and not _is_known_tag(elem.tag):
+            found.append(_location(path, str(elem.tag)))
+        if elem.VR == "SQ":
+            for index, item in enumerate(elem.value):
+                found.extend(unknown_tags(item, (*path, f"{elem.keyword or elem.tag}[{index}]")))
+    file_meta = getattr(ds, "file_meta", None) if not path else None
+    if file_meta is not None:
+        found.extend(unknown_tags(file_meta, ("file meta",)))
+    return found
 
 
 def _location(path: tuple[str, ...], keyword: str) -> str:
@@ -138,8 +149,9 @@ def _pseudonymise_elements(
 
     A value that is not valid for its VR (for example a date that is not a date) cannot be
     pseudonymised. It is emptied, so it does not pass through, and a warning names the
-    element, its tag and VR, the value, and where it is: the source, then each sequence and
-    item number leading to it. The value logged is the original, so the log is patient data.
+    element, its tag and VR, and where it is: the source, then each sequence and item number
+    leading to it. That is enough to find the value in the original. The value itself, and
+    the error's text (which may quote it), are not logged, so the log holds no patient data.
     """
     for keyword in keywords:
         if hasattr(ds, keyword):
@@ -151,13 +163,12 @@ def _pseudonymise_elements(
             except (ValueError, decimal.InvalidOperation) as error:
                 elem = ds[keyword]
                 logger.warning(
-                    "Invalid value emptied during pseudonymisation: %s%s %s VR %s, value %r (%s)",
+                    "Invalid value emptied during pseudonymisation: %s%s %s VR %s (%s)",
                     f"{source}: " if source else "",
                     _location(path, keyword),
                     elem.tag,
                     elem.VR,
-                    current_value,
-                    error,
+                    type(error).__name__,
                 )
                 replacement = ""
             setattr(ds, keyword, replacement)
@@ -186,7 +197,8 @@ def pseudonymise_dataset(
         source: names the dataset in warnings, for example its file path.
 
     Raises:
-        UnknownTagsError: if ``ds`` has public elements that pydicom does not know.
+        UnknownTagsError: if ``ds``, its sequences or its file meta have public elements that
+            pydicom does not know.
     """
     ds_pseudo = copy.deepcopy(ds)
     unknown = unknown_tags(ds_pseudo)
@@ -194,7 +206,8 @@ def pseudonymise_dataset(
         raise UnknownTagsError(
             "These public elements are not in pydicom's DICOM dictionary and may hold "
             "identifying information, so the dataset was not pseudonymised: "
-            + ", ".join(str(tag) for tag in unknown)
+            + (f"{source}: " if source else "")
+            + ", ".join(unknown)
         )
     ds_pseudo.remove_private_tags()
     keywords = [k for k in PSEUDONYMISATION_KEYWORDS if k not in keywords_to_leave_unchanged]

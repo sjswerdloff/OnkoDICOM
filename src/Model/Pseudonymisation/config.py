@@ -63,10 +63,33 @@ def _read_toml(path: pathlib.Path) -> dict:
         ) from error
 
 
+def _exists(path: pathlib.Path) -> bool:
+    """Whether ``path`` exists; a symlink whose target cannot be reached is an error, not absence.
+
+    ``Path.exists()`` is false for such a link (a shared configuration on a share that is
+    offline), and treating that as "no configuration" would create a new pepper.
+
+    Raises:
+        PseudonymisationConfigError: if ``path`` is a symlink whose target does not exist.
+    """
+    if path.exists():
+        return True
+    if path.is_symlink():
+        raise PseudonymisationConfigError(
+            f"The pseudonymisation configuration {path} is a link to {os.readlink(path)}, which cannot "
+            "be reached. Pseudonymisation stopped so that the pepper and jitter are not replaced."
+        )
+    return False
+
+
 def _read_onkodicom_config() -> dict:
-    """OnkoDICOM's configuration, or an empty one if the file does not exist yet."""
+    """OnkoDICOM's configuration, or an empty one if the file does not exist yet.
+
+    Raises:
+        PseudonymisationConfigError: if it exists but cannot be read, or is a broken link.
+    """
     path = onkodicom_config_path()
-    return _read_toml(path) if path.exists() else {}
+    return _read_toml(path) if _exists(path) else {}
 
 
 def _read_pymedphys_config() -> dict:
@@ -77,7 +100,7 @@ def _read_pymedphys_config() -> dict:
             redirects loop.
     """
     config_path = pymedphys_config_path()
-    if not config_path.exists():
+    if not _exists(config_path):
         return {}
     read_already: set[pathlib.Path] = set()
     while True:
@@ -95,17 +118,21 @@ def _read_pymedphys_config() -> dict:
             return results
 
 
-def _get_or_move_or_create(key: str, create):
+def _get_or_move_or_create(key: str, create, is_valid):
     """Return ``[pseudo] key``: from OnkoDICOM's configuration, else moved from pymedphys's, else new.
 
     A value moved or created is written to OnkoDICOM's configuration, keeping its other keys.
+
+    Raises:
+        PseudonymisationConfigError: if a configuration cannot be read, or holds a value for
+            ``key`` that ``is_valid`` rejects.
     """
     onkodicom = _read_onkodicom_config()
     if key in onkodicom.get("pseudo", {}):
-        return onkodicom["pseudo"][key]
+        return _checked(key, onkodicom["pseudo"][key], is_valid, onkodicom_config_path())
     pymedphys = _read_pymedphys_config().get("pseudo", {})
     if key in pymedphys:
-        value = pymedphys[key]
+        value = _checked(key, pymedphys[key], is_valid, pymedphys_config_path())
         logger.info("Pseudonymisation %s copied from the pymedphys configuration to %s", key, onkodicom_config_path())
     else:
         value = create()
@@ -117,17 +144,35 @@ def _get_or_move_or_create(key: str, create):
     return value
 
 
+def _checked(key: str, value, is_valid, path: pathlib.Path):
+    """Return ``value`` if ``is_valid(value)``.
+
+    Raises:
+        PseudonymisationConfigError: otherwise; the value is not quoted, since it may be the pepper.
+    """
+    if not is_valid(value):
+        raise PseudonymisationConfigError(
+            f"The pseudonymisation {key} in {path} is not valid (a {type(value).__name__}). "
+            "Pseudonymisation stopped so that the pepper and jitter are not replaced."
+        )
+    return value
+
+
 def _write_atomically(path: pathlib.Path, config: dict) -> None:
     """Replace ``path`` with ``config`` in one step, so a failure part-way leaves the old file whole.
 
     Rewriting in place could leave the file empty or partial (a crash, a full disk), and the
-    next run would then create a new pepper, changing every pseudonym (#69). The new file
-    keeps the old one's permissions; a first file is readable by its owner only.
+    next run would then create a new pepper, changing every pseudonym (#69). The directory
+    is synced after the replace, so a power loss cannot undo it.
+
+    The new file keeps the old one's permissions, except that it is never readable or
+    writable by every user: it holds the pepper. A site may share it with a group through a
+    link, so group permissions are kept. A first file is readable by its owner only.
     """
     # Through a symlink, the file to replace is its target: os.replace would replace the link
     # itself, and a configuration reached by a link would stop being written.
     path = path.resolve()
-    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+    mode = stat.S_IMODE(path.stat().st_mode) & ~0o007 if path.exists() else 0o600
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
@@ -140,6 +185,18 @@ def _write_atomically(path: pathlib.Path, config: dict) -> None:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+    _sync_directory(path.parent)
+
+
+def _sync_directory(directory: pathlib.Path) -> None:
+    """Make a replace in ``directory`` durable. POSIX only: Windows cannot open a directory to sync it."""
+    if os.name != "posix":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 @functools.lru_cache()
@@ -150,9 +207,12 @@ def get_pepper() -> bytes:
     the pseudonyms harder.
 
     Raises:
-        PseudonymisationConfigError: if a configuration exists but cannot be read.
+        PseudonymisationConfigError: if a configuration exists but cannot be read, or its
+            pepper is not ASCII text.
     """
-    return _get_or_move_or_create("pepper", lambda: secrets.token_urlsafe(32)).encode("ASCII")
+    return _get_or_move_or_create(
+        "pepper", lambda: secrets.token_urlsafe(32), lambda v: isinstance(v, str) and v.isascii()
+    ).encode("ASCII")
 
 
 @functools.lru_cache()
@@ -160,9 +220,15 @@ def get_epoch_jitter() -> int:
     """Return the number of days (0 to 999) added to shifted dates.
 
     Raises:
-        PseudonymisationConfigError: if a configuration exists but cannot be read.
+        PseudonymisationConfigError: if a configuration exists but cannot be read, or its
+            jitter is not a whole number. A new jitter is from 0 to 999, but pymedphys accepted
+            any whole number, and a site may have set one.
     """
-    return _get_or_move_or_create("epoch_jitter", lambda: secrets.randbelow(1000))
+    return _get_or_move_or_create(
+        "epoch_jitter",
+        lambda: secrets.randbelow(1000),
+        lambda v: isinstance(v, int) and not isinstance(v, bool),
+    )
 
 
 def clear_cache() -> None:
