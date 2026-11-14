@@ -68,10 +68,16 @@ def pseudonymise_AS(value) -> str:
     (years to months, months to weeks, weeks to days) and moved by a random step. The step
     is -2, -1, 0 or 1: pymedphys's ``random.randrange(-2, 2)`` excludes 2, and that range is kept.
 
+    An age of zero stays zero: pymedphys could turn ``000Y`` into ``-02M``, which is not a DICOM
+    age, so a step below zero is the one place this differs from pymedphys.
+
     Raises:
         ValueError: for an age of 10 days or fewer, which pymedphys also cannot pseudonymise
-            (it fails there with an UnboundLocalError).
+            (it fails there with an UnboundLocalError), and for a value shorter than the four
+            characters of a DICOM age, where pymedphys failed with an IndexError.
     """
+    if len(value) < 4:
+        raise ValueError(f"Cannot pseudonymise an age of {value!r}: a DICOM age has four characters")
     increment = secrets.randbelow(4) - 2
     numeric = int(value[0:3])
     unit = value[3]
@@ -93,7 +99,7 @@ def pseudonymise_AS(value) -> str:
         pseudo_unit = "D"
     else:
         raise ValueError(f"Cannot pseudonymise an age of {value!r}: no unit smaller than days")
-    return str(pseudo_numeric).zfill(3) + pseudo_unit
+    return str(max(pseudo_numeric, 0)).zfill(3) + pseudo_unit
 
 
 def pseudonymise_CS(value) -> str:
@@ -133,17 +139,20 @@ def pseudonymise_DS(value) -> str:
 
     The hash has no pepper, as in pymedphys.
 
+    The digits come from the first hexadecimal digits of the hash, read as one integer. That
+    integer can have fewer decimal digits than the value (``"00"`` is 0), and pymedphys then
+    failed, so about one valid two-digit value in 25 could not be pseudonymised. Here it is
+    padded with leading zeros instead; wherever pymedphys gave a result, this gives the same.
+
     Raises:
         decimal.InvalidOperation: if the value (for example a multi-valued element) is not one decimal.
-        ValueError: when the hash yields fewer decimal digits than the value has; pymedphys
-            fails there too.
     """
     # str() gives the original text of a pydicom DSfloat or DSdecimal.
     original = str(value)
     as_tuple = Decimal(original).as_tuple()
     count_digits = len(as_tuple.digits)
     hex_digest = hashlib.new("sha3_256", original.encode("ASCII")).hexdigest()
-    integer_string = str(int(hex_digest[0:count_digits], 16))
+    integer_string = str(int(hex_digest[0:count_digits], 16)).zfill(count_digits)
     new_digits = tuple(int(integer_string[i : i + 1]) for i in range(count_digits))
     return str(Decimal((as_tuple.sign, new_digits, as_tuple.exponent)))
 
