@@ -559,23 +559,6 @@ def test_pymedphys_values_are_moved_to_onkodicom(tmp_path: Path, monkeypatch: py
         _clear_caches()
 
 
-def test_a_missing_value_is_moved_while_the_others_are_kept(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: OnkoDICOM has the pepper and other settings, pymedphys the jitter: the jitter is moved over."""
-    _, onko_file, _ = _home(
-        tmp_path, monkeypatch,
-        onkodicom=toml.dumps({"pseudo": {"pepper": "onkodicom-pepper"}, "other": {"setting": "kept"}}),
-        pymedphys=toml.dumps({"pseudo": {"pepper": "pymedphys-pepper", "epoch_jitter": 33}}),
-    )
-    try:
-        assert config.get_epoch_jitter() == 33
-        assert config.get_pepper() == b"onkodicom-pepper"
-        assert toml.loads(onko_file.read_text()) == {
-            "pseudo": {"pepper": "onkodicom-pepper", "epoch_jitter": 33},
-            "other": {"setting": "kept"},
-        }
-    finally:
-        _clear_caches()
-
 
 def test_a_first_run_creates_the_values_in_onkodicom_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Contract: with neither configuration, new values go into OnkoDICOM's file, readable by its owner only."""
@@ -653,60 +636,7 @@ def test_a_pymedphys_redirect_loop_stops_pseudonymisation(
         _clear_caches()
 
 
-def test_a_failed_write_leaves_the_pepper_in_place(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract (#69): storing a new jitter fails part-way; OnkoDICOM's file still holds the pepper, whole."""
-    _, onko_file, _ = _home(
-        tmp_path, monkeypatch, onkodicom=toml.dumps({"pseudo": {"pepper": PEPPER}, "other": {"setting": "kept"}})
-    )
-    before = onko_file.read_bytes()
 
-    def fail_part_way(data: dict, f) -> None:
-        f.write("[pseudo]\n")  # some bytes reach the file, then the disk is full
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(config.toml, "dump", fail_part_way)
-    try:
-        with pytest.raises(OSError, match="No space left"):
-            config.get_epoch_jitter()
-        assert onko_file.read_bytes() == before
-        assert sorted(p.name for p in onko_file.parent.iterdir()) == ["pseudonymisation.toml"]
-    finally:
-        _clear_caches()
-
-
-def test_a_rewritten_config_keeps_its_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: replacing the file keeps its owner and group permissions (only every user's are ever removed).
-
-    POSIX permission bits only: Windows keeps only a read-only flag, so chmod(0o640) reads back as 0o666 there.
-    """
-    _, onko_file, _ = _home(tmp_path, monkeypatch, onkodicom=toml.dumps({"pseudo": {"pepper": PEPPER}}))
-    onko_file.chmod(0o640)
-    try:
-        config.get_epoch_jitter()
-        if os.name == "posix":
-            assert onko_file.stat().st_mode & 0o777 == 0o640
-        assert "epoch_jitter" in toml.loads(onko_file.read_text())["pseudo"]
-    finally:
-        _clear_caches()
-
-
-def test_a_symlinked_config_is_written_through_the_link(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: an OnkoDICOM config reached by a symlink (a site's shared file) gets the new value; the link stays."""
-    shared = tmp_path / "share" / "pseudonymisation.toml"
-    shared.parent.mkdir()
-    shared.write_text(toml.dumps({"pseudo": {"pepper": PEPPER}}))
-    home = tmp_path / "home"
-    link = home / ".OnkoDICOM" / "pseudonymisation.toml"
-    link.parent.mkdir(parents=True)
-    link.symlink_to(shared)
-    _use_home(monkeypatch, home)
-    try:
-        jitter = config.get_epoch_jitter()
-        assert link.is_symlink() and link.resolve() == shared.resolve()
-        assert toml.loads(shared.read_text())["pseudo"] == {"pepper": PEPPER, "epoch_jitter": jitter}
-        assert sorted(p.name for p in shared.parent.iterdir()) == ["pseudonymisation.toml"]
-    finally:
-        _clear_caches()
 
 
 @pytest.mark.parametrize("which", ["onkodicom", "pymedphys"])
@@ -731,37 +661,6 @@ def test_a_config_link_to_an_unreachable_file_stops_pseudonymisation(
         _clear_caches()
 
 
-@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits: Windows keeps only a read-only flag")
-def test_a_rewritten_config_is_never_readable_by_every_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: writing the pepper into a world-readable file takes away the other users' access;
-    the owner's and group's (a site sharing it with a group) are kept."""
-    _, onko_file, _ = _home(tmp_path, monkeypatch, onkodicom=toml.dumps({"other": {"setting": "kept"}}))
-    onko_file.chmod(0o666)
-    try:
-        config.get_pepper()
-        assert onko_file.stat().st_mode & 0o777 == 0o660
-    finally:
-        _clear_caches()
-
-
-@pytest.mark.skipif(os.name != "posix", reason="a directory can be synced only on POSIX")
-def test_the_directory_is_synced_after_the_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: after the file is replaced its directory is synced, so a power loss cannot undo the replace."""
-    _, onko_file, _ = _home(tmp_path, monkeypatch, onkodicom=toml.dumps({"pseudo": {"pepper": PEPPER}}))
-    events = []
-    real_replace = os.replace
-
-    def replace(src, dst):
-        real_replace(src, dst)
-        events.append(("replace", Path(dst)))
-
-    monkeypatch.setattr(config.os, "replace", replace)
-    monkeypatch.setattr(config, "_sync_directory", lambda d: events.append(("sync directory", Path(d))))
-    try:
-        config.get_epoch_jitter()
-        assert events == [("replace", onko_file.resolve()), ("sync directory", onko_file.resolve().parent)]
-    finally:
-        _clear_caches()
 
 
 def test_sync_directory_syncs_that_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -775,9 +674,9 @@ def test_sync_directory_syncs_that_directory(tmp_path: Path, monkeypatch: pytest
 @pytest.mark.parametrize(
     "pseudo_table,bad",
     [
-        ({"pepper": 12345}, "pepper"),
-        ({"pepper": ["a", "list"]}, "pepper"),
-        ({"pepper": "Señor-pepper"}, "pepper"),
+        ({"pepper": 12345, "epoch_jitter": EPOCH_JITTER}, "pepper"),
+        ({"pepper": ["a", "list"], "epoch_jitter": EPOCH_JITTER}, "pepper"),
+        ({"pepper": "Señor-pepper", "epoch_jitter": EPOCH_JITTER}, "pepper"),
         ({"pepper": PEPPER, "epoch_jitter": "321"}, "epoch_jitter"),
         ({"pepper": PEPPER, "epoch_jitter": 32.1}, "epoch_jitter"),
         ({"pepper": PEPPER, "epoch_jitter": True}, "epoch_jitter"),
@@ -809,3 +708,157 @@ def test_a_jitter_a_site_set_outside_the_generated_range_is_kept(tmp_path: Path,
         assert config.get_epoch_jitter() == 1500
     finally:
         _clear_caches()
+
+
+# --- The configuration is written only to create it (#74) -----------------------------------------------------------
+
+
+def test_an_incomplete_onkodicom_config_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: an OnkoDICOM file without both values is refused, not completed, even when pymedphys has the
+    missing one: another OnkoDICOM could be completing it differently at the same moment. Nothing is written."""
+    _, onko_file, pmp_file = _home(
+        tmp_path, monkeypatch,
+        onkodicom=toml.dumps({"pseudo": {"pepper": "onkodicom-pepper"}}),
+        pymedphys=toml.dumps({"pseudo": {"pepper": "pymedphys-pepper", "epoch_jitter": 33}}),
+    )
+    before = {p: p.read_bytes() for p in (onko_file, pmp_file)}
+    try:
+        for get in (config.get_pepper, config.get_epoch_jitter):
+            with pytest.raises(config.PseudonymisationConfigError, match="has no epoch_jitter") as refused:
+                get()
+            assert "onkodicom-pepper" not in str(refused.value)
+        assert {p: p.read_bytes() for p in (onko_file, pmp_file)} == before
+        assert sorted(p.name for p in onko_file.parent.iterdir()) == ["pseudonymisation.toml"]
+    finally:
+        _clear_caches()
+
+
+def test_a_config_reached_by_a_link_is_read_and_not_written(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: a site's shared configuration, reached by a link, is used as it is; the link and the file are unchanged."""
+    shared = tmp_path / "share" / "pseudonymisation.toml"
+    shared.parent.mkdir()
+    shared.write_text(toml.dumps({"pseudo": {"pepper": PEPPER, "epoch_jitter": EPOCH_JITTER}}))
+    before = shared.read_bytes()
+    home = tmp_path / "home"
+    link = home / ".OnkoDICOM" / "pseudonymisation.toml"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(shared)
+    _use_home(monkeypatch, home)
+    try:
+        assert (config.get_pepper(), config.get_epoch_jitter()) == (PEPPER.encode("ASCII"), EPOCH_JITTER)
+        assert link.is_symlink() and shared.read_bytes() == before
+        assert sorted(p.name for p in shared.parent.iterdir()) == ["pseudonymisation.toml"]
+    finally:
+        _clear_caches()
+
+
+def test_a_failed_creation_leaves_no_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: creation that fails part-way (a full disk) leaves no configuration and no temporary file behind,
+    so nothing half-written is ever read as the pepper."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch)
+
+    def fail_part_way(data: dict, f) -> None:
+        f.write("[pseudo]\n")  # some bytes reach the file, then the disk is full
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(config.toml, "dump", fail_part_way)
+    try:
+        with pytest.raises(OSError, match="No space left"):
+            config.get_pepper()
+        assert list(onko_file.parent.iterdir()) == []
+    finally:
+        _clear_caches()
+
+
+def test_a_file_system_without_hard_links_stops_pseudonymisation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: if the file cannot be created exclusively, pseudonymisation stops; no pepper is used unsaved."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch)
+
+    def no_links(src, dst):
+        raise OSError(1, "Operation not permitted")
+
+    monkeypatch.setattr(config.os, "link", no_links)
+    try:
+        with pytest.raises(config.PseudonymisationConfigError, match="Cannot create"):
+            config.get_pepper()
+        assert list(onko_file.parent.iterdir()) == []
+    finally:
+        _clear_caches()
+
+
+def test_the_directory_is_synced_after_the_file_is_created(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: once the file is linked into place its directory is synced, so a power loss cannot undo it."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch)
+    events = []
+    real_link = os.link
+
+    def link(src, dst):
+        real_link(src, dst)
+        events.append(("link", Path(dst)))
+
+    monkeypatch.setattr(config.os, "link", link)
+    monkeypatch.setattr(config, "_sync_directory", lambda d: events.append(("sync directory", Path(d))))
+    try:
+        config.get_pepper()
+        assert events == [("link", onko_file), ("sync directory", onko_file.parent)]
+    finally:
+        _clear_caches()
+
+
+def test_the_values_of_whoever_created_the_file_first_are_used(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract (#74): if another OnkoDICOM creates the file between this one finding it absent and creating it,
+    this one uses the other's values, not its own, and writes nothing."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch)
+    theirs = toml.dumps({"pseudo": {"pepper": "the-other-pepper", "epoch_jitter": 7}})
+    real_link = os.link
+
+    def the_other_one_wins(src, dst):
+        Path(dst).write_text(theirs)  # the other OnkoDICOM's link landed first
+        real_link(src, dst)
+
+    monkeypatch.setattr(config.os, "link", the_other_one_wins)
+    try:
+        assert config.get_pepper() == b"the-other-pepper"
+        assert config.get_epoch_jitter() == 7
+        assert onko_file.read_text() == theirs
+        assert sorted(p.name for p in onko_file.parent.iterdir()) == ["pseudonymisation.toml"]
+    finally:
+        _clear_caches()
+
+
+_RACER = """
+import json, os, pathlib, sys, time
+sys.path.insert(0, os.getcwd())
+from src.Model.Pseudonymisation import config
+start = pathlib.Path(sys.argv[1])
+while not start.exists():
+    time.sleep(0.001)
+print(json.dumps([config.get_pepper().decode("ASCII"), config.get_epoch_jitter()]))
+"""
+
+
+@pytest.mark.timeout(120)
+def test_processes_starting_at_once_use_one_pepper(tmp_path: Path) -> None:
+    """Contract (#74): OnkoDICOMs that pseudonymise for the first time at the same moment all use one pepper and
+    one jitter, and the file holds exactly those.
+
+    A real race, so it detects a regression only sometimes: against the code before #74 it failed once in five
+    runs (every process had cached jitter 895 while the file held 14). It never fails on correct code. The
+    deterministic test above is what guards exclusive creation."""
+    import json
+    import subprocess
+    import sys
+
+    home = tmp_path / "home"
+    home.mkdir()
+    start = tmp_path / "start"
+    env = {**os.environ, "HOME": str(home), "USERPROFILE": str(home)}
+    racers = [
+        subprocess.Popen([sys.executable, "-c", _RACER, str(start)], env=env, stdout=subprocess.PIPE, text=True)
+        for _ in range(8)
+    ]
+    start.touch()
+    results = [json.loads(r.communicate()[0]) for r in racers]
+    assert all(r.returncode == 0 for r in racers)
+    on_disk = toml.loads((home / ".OnkoDICOM" / "pseudonymisation.toml").read_text())["pseudo"]
+    assert {tuple(r) for r in results} == {(on_disk["pepper"], on_disk["epoch_jitter"])}
