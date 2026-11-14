@@ -5,10 +5,13 @@ pointing at a temporary directory: pymedphys reads the pepper and jitter from ~/
 there, and OnkoDICOM moves them into ~/.OnkoDICOM/pseudonymisation.toml, so both use the same values.
 """
 
+import base64
 import copy
 import decimal
+import hashlib
 import io
 import os
+from decimal import Decimal
 from pathlib import Path
 
 import pydicom
@@ -113,15 +116,97 @@ def test_age_matches_pymedphys_for_each_random_step(
 
     pymedphys draws the step with random.randrange(-2, 2): -2, -1, 0 or 1.
     """
-    monkeypatch.setattr(pmp_strategy.random, "randrange", lambda start, stop: increment)
-    monkeypatch.setattr(strategy.secrets, "randbelow", lambda n: increment + 2)
+    def pmp_randrange(start: int, stop: int) -> int:
+        assert (start, stop) == (-2, 2)
+        return increment
+
+    def our_randbelow(n: int) -> int:
+        assert n == 4  # four steps: -2, -1, 0, 1
+        return increment + 2
+
+    monkeypatch.setattr(pmp_strategy.random, "randrange", pmp_randrange)
+    monkeypatch.setattr(strategy.secrets, "randbelow", our_randbelow)
     assert pseudo.pseudonymise_value("PatientAge", age) == _pmp_value("PatientAge", age)
 
 
-def test_age_step_covers_exactly_pymedphys_range() -> None:
-    """Contract: the random step is one of -2, -1, 0, 1, like pymedphys's randrange(-2, 2)."""
-    steps = {strategy.secrets.randbelow(4) - 2 for _ in range(400)}
-    assert steps == {-2, -1, 0, 1}
+def test_age_step_covers_exactly_pymedphys_range(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: the age pseudonymiser moves an age by -2, -1, 0 or 1, like pymedphys's randrange(-2, 2).
+
+    Every result the random source can give is fed to the pseudonymiser itself.
+    """
+    bounds = []
+
+    def randbelow(n: int) -> int:
+        bounds.append(n)
+        return results.pop()
+
+    monkeypatch.setattr(strategy.secrets, "randbelow", randbelow)
+    ages = set()
+    for drawn in range(4):
+        results = [drawn]
+        ages.add(strategy.pseudonymise_AS("015Y"))
+    assert set(bounds) == {4}
+    assert ages == {"013Y", "014Y", "015Y", "016Y"}
+
+
+@pytest.mark.parametrize("age", ["000Y", "000M", "000W", "001W"])
+@pytest.mark.parametrize("increment", [-2, -1, 0, 1])
+def test_a_young_age_never_becomes_negative(
+    known_config: Path, monkeypatch: pytest.MonkeyPatch, age: str, increment: int
+) -> None:
+    """Contract: a step below zero gives zero; otherwise the result is pymedphys's.
+
+    pymedphys turned 000Y into -02M, which is not a DICOM age.
+    """
+    monkeypatch.setattr(pmp_strategy.random, "randrange", lambda start, stop: increment)
+    monkeypatch.setattr(strategy.secrets, "randbelow", lambda n: increment + 2)
+    ours = pseudo.pseudonymise_value("PatientAge", age)
+    reference = _pmp_value("PatientAge", age)
+    assert ours[:3].isdigit() and len(ours) == 4
+    if reference.startswith("-"):
+        assert ours == "000" + reference[3]
+    else:
+        assert ours == reference
+
+
+def _short_hash_ds_values() -> list[str]:
+    """Two- and three-digit DS values whose hash starts with too few decimal digits (where pymedphys failed)."""
+    found = []
+    for number in range(10, 1000):
+        text = str(number)
+        digest = hashlib.new("sha3_256", text.encode("ASCII")).hexdigest()
+        if len(str(int(digest[0 : len(text)], 16))) < len(text):
+            found.append(text)
+    return found
+
+
+SHORT_HASH_DS = _short_hash_ds_values()
+
+
+def test_short_hash_ds_values_exist() -> None:
+    """The DS test below needs such values; about one two-digit value in 25 is one."""
+    assert any(len(v) == 2 for v in SHORT_HASH_DS) and any(len(v) == 3 for v in SHORT_HASH_DS)
+
+
+@pytest.mark.parametrize("value", SHORT_HASH_DS[:6])
+def test_a_ds_whose_hash_has_too_few_digits_is_still_pseudonymised(known_config: Path, value: str) -> None:
+    """Contract: a valid DS is pseudonymised to a valid DS of no more digits, never emptied.
+
+    The padding zeros lead, and a decimal does not print leading zeros, so "04" is written "4".
+
+    In OnkoDICOM only PatientWeight and PatientSize are DS, and Anon.py leaves both unchanged,
+    so this protects other callers of the module.
+
+    pymedphys failed on these values, so padding the hash with zeros changes no earlier pseudonym.
+    """
+    with pytest.raises(ValueError):
+        _pmp_value("PatientWeight", DSfloat(value))
+    ours = pseudo.pseudonymise_value("PatientWeight", DSfloat(value))
+    assert ours.isdigit() and 1 <= len(ours) <= len(value)
+    assert ours == str(Decimal(ours))  # a plain decimal, as DS requires
+    ds = _small_dataset()
+    ds.PatientWeight = value  # Anon.py leaves it unchanged; other callers need not
+    assert str(pseudo.pseudonymise_dataset(ds).PatientWeight) == ours
 
 
 @pytest.mark.parametrize(
@@ -248,7 +333,8 @@ def test_invalid_dates_are_emptied_and_logged(
     assert len(warnings) == len(invalid)
     for keyword, value in invalid.items():
         tag = str(raw[keyword].tag)
-        assert any(str(path) in w and keyword in w and tag in w and value in w for w in warnings), keyword
+        assert any(str(path) in w and keyword in w and tag in w for w in warnings), keyword
+        assert not any(value in w for w in warnings), keyword  # the log holds no patient data
 
     valid = pseudo.pseudonymise_dataset(
         _with_conformant_dates(pydicom.dcmread(path)), keywords_to_leave_unchanged=LEAVE_UNCHANGED
@@ -270,7 +356,7 @@ def test_invalid_value_inside_sequence_is_located(known_config: Path, caplog: py
     assert ours.StudyDate != "" and ours.StudyDate != ds.StudyDate  # valid dates still shifted
     (warning,) = [r.getMessage() for r in caplog.records if "Invalid value emptied" in r.getMessage()]
     assert "patient/RS.dcm: ReferencedStudySequence[1] > PatientBirthDate (0010,0030) VR DA" in warning
-    assert "'not-a-date'" in warning
+    assert "not-a-date" not in warning  # the location finds the value; the log does not hold it
 
 
 @pytest.mark.parametrize(
@@ -278,6 +364,7 @@ def test_invalid_value_inside_sequence_is_located(known_config: Path, caplog: py
     [
         ("PatientWeight", MultiValue(DSfloat, ["1.5", "2.5"])),  # decimal.InvalidOperation
         ("PatientAge", "005D"),  # ValueError: nothing smaller than days
+        ("PatientAge", "4"),  # shorter than a DICOM age: pymedphys failed with an IndexError
         ("AcquisitionDateTime", "not a date"),
     ],
 )
@@ -315,7 +402,9 @@ def test_non_ascii_name_is_pseudonymised_the_same_in_any_character_set(known_con
 
     ours = pseudo.pseudonymise_dataset(read_back)
     assert ours.PatientName == pseudo.pseudonymise_value("PatientName", "Müller^Jürgen")
-    assert ours.InstitutionName == pseudo.pseudonymise_value("InstitutionName", "Hôpital Señor")
+    # Computed here, not by the code under test: SHA3-256 of the UTF-8 bytes and the pepper, base64, LO length.
+    digest = hashlib.sha3_256("Hôpital Señor".encode("UTF-8") + PEPPER.encode("ASCII")).digest()
+    assert ours.InstitutionName == base64.standard_b64encode(digest).decode("ASCII").rstrip("=")[0:64]
     assert "Müller" not in str(ours.PatientName) and ours.InstitutionName != "Hôpital Señor"
     assert ours.PatientName.family_name.isascii() and ours.InstitutionName.isascii()
 
@@ -366,6 +455,33 @@ def test_tag_unknown_to_pydicom_is_refused(known_config: Path) -> None:
                       identifying_keywords=pmp_pseudonymise.get_default_pseudonymisation_keywords())
     with pytest.raises(pseudo.UnknownTagsError):
         pseudo.pseudonymise_dataset(ds)
+
+
+@pytest.mark.parametrize("where", ["sequence item", "nested sequence item", "file meta"])
+def test_tag_unknown_to_pydicom_is_refused_wherever_it_is(known_config: Path, where: str) -> None:
+    """Contract: an unknown public element inside a sequence or in the file meta is refused too, with its location.
+
+    pymedphys checked only the top level, so these passed through unchanged.
+    """
+    ds = _small_dataset()
+    unknown = 0x00120099 if where != "file meta" else 0x00020099
+    assert unknown not in pydicom.datadict.DicomDictionary
+    if where == "sequence item":
+        ds.ReferencedStudySequence[0].add_new(unknown, "LO", "who knows")
+        location = "ReferencedStudySequence[0] > (0012,0099)"
+    elif where == "nested sequence item":
+        inner = Dataset()
+        inner.add_new(unknown, "LO", "who knows")
+        ds.ReferencedStudySequence[0].ReferencedSeriesSequence = [Dataset(), inner]
+        location = "ReferencedStudySequence[0] > ReferencedSeriesSequence[1] > (0012,0099)"
+    else:
+        ds.file_meta = pydicom.dataset.FileMetaDataset()
+        ds.file_meta.add_new(unknown, "LO", "who knows")
+        location = "file meta > (0002,0099)"
+    with pytest.raises(pseudo.UnknownTagsError, match=r"patient/RS\.dcm: ") as refused:
+        pseudo.pseudonymise_dataset(ds, source="patient/RS.dcm")
+    assert location in str(refused.value)
+    assert "who knows" not in str(refused.value)
 
 
 def test_tag_known_to_pydicom_but_not_to_pymedphys_is_accepted(known_config: Path) -> None:
@@ -559,7 +675,7 @@ def test_a_failed_write_leaves_the_pepper_in_place(tmp_path: Path, monkeypatch: 
 
 
 def test_a_rewritten_config_keeps_its_permissions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Contract: replacing the file does not change who can read it.
+    """Contract: replacing the file keeps its owner and group permissions (only every user's are ever removed).
 
     POSIX permission bits only: Windows keeps only a read-only flag, so chmod(0o640) reads back as 0o666 there.
     """
@@ -589,5 +705,107 @@ def test_a_symlinked_config_is_written_through_the_link(tmp_path: Path, monkeypa
         assert link.is_symlink() and link.resolve() == shared.resolve()
         assert toml.loads(shared.read_text())["pseudo"] == {"pepper": PEPPER, "epoch_jitter": jitter}
         assert sorted(p.name for p in shared.parent.iterdir()) == ["pseudonymisation.toml"]
+    finally:
+        _clear_caches()
+
+
+@pytest.mark.parametrize("which", ["onkodicom", "pymedphys"])
+def test_a_config_link_to_an_unreachable_file_stops_pseudonymisation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    """Contract: a configuration that is a link to a file that cannot be reached (an offline share) is an error,
+    not an absent configuration: nothing is created, so no new pepper replaces the shared one."""
+    home = tmp_path / "home"
+    link = home / (".OnkoDICOM/pseudonymisation.toml" if which == "onkodicom" else ".pymedphys/config.toml")
+    link.parent.mkdir(parents=True)
+    link.symlink_to(tmp_path / "offline-share" / "config.toml")
+    _use_home(monkeypatch, home)
+    try:
+        with pytest.raises(config.PseudonymisationConfigError, match="cannot be reached"):
+            config.get_pepper()
+        assert link.is_symlink() and not link.exists()
+        assert not (tmp_path / "offline-share").exists()
+        if which == "pymedphys":
+            assert not config.onkodicom_config_path().exists()
+    finally:
+        _clear_caches()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits: Windows keeps only a read-only flag")
+def test_a_rewritten_config_is_never_readable_by_every_user(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: writing the pepper into a world-readable file takes away the other users' access;
+    the owner's and group's (a site sharing it with a group) are kept."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch, onkodicom=toml.dumps({"other": {"setting": "kept"}}))
+    onko_file.chmod(0o666)
+    try:
+        config.get_pepper()
+        assert onko_file.stat().st_mode & 0o777 == 0o660
+    finally:
+        _clear_caches()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="a directory can be synced only on POSIX")
+def test_the_directory_is_synced_after_the_replace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: after the file is replaced its directory is synced, so a power loss cannot undo the replace."""
+    _, onko_file, _ = _home(tmp_path, monkeypatch, onkodicom=toml.dumps({"pseudo": {"pepper": PEPPER}}))
+    events = []
+    real_replace = os.replace
+
+    def replace(src, dst):
+        real_replace(src, dst)
+        events.append(("replace", Path(dst)))
+
+    monkeypatch.setattr(config.os, "replace", replace)
+    monkeypatch.setattr(config, "_sync_directory", lambda d: events.append(("sync directory", Path(d))))
+    try:
+        config.get_epoch_jitter()
+        assert events == [("replace", onko_file.resolve()), ("sync directory", onko_file.resolve().parent)]
+    finally:
+        _clear_caches()
+
+
+def test_sync_directory_syncs_that_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: _sync_directory opens the directory itself and fsyncs it (POSIX); elsewhere it does nothing."""
+    synced = []
+    monkeypatch.setattr(config.os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino))
+    config._sync_directory(tmp_path)
+    assert synced == ([os.stat(tmp_path).st_ino] if os.name == "posix" else [])
+
+
+@pytest.mark.parametrize(
+    "pseudo_table,bad",
+    [
+        ({"pepper": 12345}, "pepper"),
+        ({"pepper": ["a", "list"]}, "pepper"),
+        ({"pepper": "Señor-pepper"}, "pepper"),
+        ({"pepper": PEPPER, "epoch_jitter": "321"}, "epoch_jitter"),
+        ({"pepper": PEPPER, "epoch_jitter": 32.1}, "epoch_jitter"),
+        ({"pepper": PEPPER, "epoch_jitter": True}, "epoch_jitter"),
+    ],
+)
+@pytest.mark.parametrize("which", ["onkodicom", "pymedphys"])
+def test_a_mistyped_setting_stops_pseudonymisation_clearly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pseudo_table: dict, bad: str, which: str
+) -> None:
+    """Contract: a pepper that is not ASCII text, or a jitter that is not a whole number, is a configuration
+    error naming the setting and the file, not a stray exception; the value is not quoted, and nothing is written."""
+    _, onko_file, pmp_file = _home(tmp_path, monkeypatch, **{which: toml.dumps({"pseudo": pseudo_table})})
+    before = {p: p.read_bytes() for p in (onko_file, pmp_file) if p.exists()}
+    try:
+        with pytest.raises(config.PseudonymisationConfigError) as refused:
+            config.get_pepper() if bad == "pepper" else config.get_epoch_jitter()
+        message = str(refused.value)
+        assert bad in message and str(onko_file if which == "onkodicom" else pmp_file) in message
+        assert str(pseudo_table[bad]) not in message
+        assert {p: p.read_bytes() for p in (onko_file, pmp_file) if p.exists()} == before
+    finally:
+        _clear_caches()
+
+
+def test_a_jitter_a_site_set_outside_the_generated_range_is_kept(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Contract: pymedphys accepted any whole number as the jitter, so one a site set by hand still works."""
+    _home(tmp_path, monkeypatch, pymedphys=toml.dumps({"pseudo": {"pepper": PEPPER, "epoch_jitter": 1500}}))
+    try:
+        assert config.get_epoch_jitter() == 1500
     finally:
         _clear_caches()
