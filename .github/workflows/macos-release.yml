@@ -1,0 +1,197 @@
+# The signed, notarized macOS installer for OnkoDICOM (The_Kindled/OnkoDICOM #93). This file lives only on the fork's
+# `main` branch, which never goes upstream (upstream PRs come from `kindled-main`), and it runs only on this fork.
+#
+# A release is a push to `main` that changes release/macos.env, which names the commit to build:
+#   ONKODICOM_SHA=<40-character commit of sjswerdloff/OnkoDICOM, normally on kindled-main>
+#   ONKODICOM_VERSION=<the version in that commit's pyproject.toml>
+# The version is checked against the commit, so a SHA pasted from the wrong place fails before anything is signed.
+#
+# Signing and notarization use the same seven secrets as Midst (midst-editor docs/macos-signing.md), set on this
+# repository with tools/setup_signing_secrets.sh: CSC_LINK, CSC_KEY_PASSWORD, CSC_INSTALLER_LINK,
+# CSC_INSTALLER_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER. A release without them fails.
+name: macOS release
+
+on:
+  push:
+    branches: [main]
+    paths: [release/macos.env]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.repository == 'sjswerdloff/OnkoDICOM'
+    runs-on: macos-15
+    timeout-minutes: 150
+    steps:
+      - name: Release control (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+
+      - name: What to build
+        id: want
+        run: |
+          f=control/release/macos.env
+          [ -f "$f" ] || { echo "::error::no $f"; exit 1; }
+          sha=$(sed -n 's/^ONKODICOM_SHA=//p' "$f")
+          version=$(sed -n 's/^ONKODICOM_VERSION=//p' "$f")
+          printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::ONKODICOM_SHA is not a 40-character commit: '$sha'"; exit 1; }
+          [ -n "$version" ] || { echo "::error::no ONKODICOM_VERSION in $f"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building OnkoDICOM $version at $sha"
+
+      - name: OnkoDICOM at that commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.want.outputs.sha }}
+          path: src
+
+      - name: The commit carries the version asked for
+        working-directory: src
+        env:
+          WANT: ${{ steps.want.outputs.version }}
+        run: |
+          got=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          [ "$got" = "$WANT" ] || { echo "::error::pyproject.toml says $got, release/macos.env says $WANT"; exit 1; }
+          [ -x packaging/macos/sign_app.sh ] && [ -x packaging/macos/build_pkg.sh ] \
+            || { echo "::error::this commit has no packaging/macos scripts (#93 not merged into it)"; exit 1; }
+
+      - name: uv, pinned
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          version: "0.13.8"
+
+      # The spec keeps the tarball as build/plastimatch/<sha256>.tar.gz and checks it every build; caching that file by
+      # the same SHA-256 means one download per plastimatch version.
+      - name: plastimatch tarball, cached by its SHA-256
+        id: pmsha
+        working-directory: src
+        run: echo "sha=$(sed -n "s/^PLASTIMATCH_SHA256 = '\([0-9a-f]*\)'.*/\1/p" OnkoDICOM-Darwin.spec)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: src/build/plastimatch/${{ steps.pmsha.outputs.sha }}.tar.gz
+          key: plastimatch-${{ steps.pmsha.outputs.sha }}
+
+      # Python 3.12, uv-managed: its interpreter needs only macOS 11, where Homebrew's needs the runner's own macOS.
+      - name: Dependencies (uv.lock)
+        working-directory: src
+        run: uv sync --locked --managed-python --python 3.12
+
+      - name: Build the app (PyInstaller)
+        working-directory: src
+        run: |
+          set -o pipefail
+          uv run pyinstaller --noconfirm OnkoDICOM-Darwin.spec 2>&1 | tee pyinstaller.log
+          a=$(lipo -archs dist/OnkoDICOM.app/Contents/MacOS/OnkoDICOM)
+          echo "architecture: $a"
+          [ "$a" = arm64 ]
+
+      # Copied from Midst's package.yml: a keychain made for this job, the two Developer ID identities imported into it,
+      # and the notarization key written to a file in RUNNER_TEMP (emptied after every job).
+      - name: Signing keychain
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_INSTALLER_LINK: ${{ secrets.CSC_INSTALLER_LINK }}
+          CSC_INSTALLER_KEY_PASSWORD: ${{ secrets.CSC_INSTALLER_KEY_PASSWORD }}
+          APPLE_API_KEY_B64: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          for v in CSC_LINK CSC_KEY_PASSWORD CSC_INSTALLER_LINK CSC_INSTALLER_KEY_PASSWORD APPLE_API_KEY_B64 APPLE_API_KEY_ID APPLE_API_ISSUER; do
+            [ -n "${!v}" ] || { echo "::error::secret for $v is not set on this repository (tools/setup_signing_secrets.sh)"; exit 1; }
+          done
+          kc="$RUNNER_TEMP/onkodicom-signing.keychain-db"
+          kcpass=$(openssl rand -base64 24)
+          security create-keychain -p "$kcpass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kcpass" "$kc"
+          import() {
+            printf '%s' "$1" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$2" -f pkcs12 \
+              -T /usr/bin/codesign -T /usr/bin/productbuild -T /usr/bin/pkgbuild
+            rm -f "$RUNNER_TEMP/cert.p12"
+          }
+          import "$CSC_LINK" "$CSC_KEY_PASSWORD"
+          import "$CSC_INSTALLER_LINK" "$CSC_INSTALLER_KEY_PASSWORD"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kcpass" "$kc" > /dev/null
+          existing=$(security list-keychains -d user | tr -d '"' | xargs)
+          # shellcheck disable=SC2086
+          security list-keychains -d user -s "$kc" $existing
+          # As Midst finds them (package.yml): every valid identity in this keychain, by name.
+          ident() { security find-identity -v "$kc" | sed -n "s/^ *[0-9]*) \([0-9A-F]\{40\}\) \"$1:.*/\1/p" | sed -n 1p; }
+          app_id=$(ident "Developer ID Application")
+          pkg_id=$(ident "Developer ID Installer")
+          [ -n "$app_id" ] || { echo "::error::no Developer ID Application identity was imported"; exit 1; }
+          [ -n "$pkg_id" ] || { echo "::error::no Developer ID Installer identity was imported"; exit 1; }
+          key="$RUNNER_TEMP/AuthKey_$APPLE_API_KEY_ID.p8"
+          printf '%s' "$APPLE_API_KEY_B64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          {
+            echo "KEYCHAIN=$kc"
+            echo "APP_IDENTITY=$app_id"
+            echo "PKG_IDENTITY=$pkg_id"
+            echo "APPLE_API_KEY=$key"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Sign the app (hardened runtime)
+        working-directory: src
+        run: packaging/macos/sign_app.sh dist/OnkoDICOM.app "$APP_IDENTITY" "$KEYCHAIN"
+
+      - name: Build and sign the installer
+        working-directory: src
+        env:
+          VERSION: ${{ steps.want.outputs.version }}
+        run: |
+          mkdir -p release
+          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$VERSION-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
+
+      # One submission: Apple checks everything nested in the .pkg. The log is kept, because a rejection names the files.
+      - name: Notarize and staple
+        working-directory: src/release
+        run: |
+          pkg=$(ls OnkoDICOM-*.pkg)
+          xcrun notarytool submit "$pkg" --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER" --wait --output-format json > notarize.json || true
+          cat notarize.json
+          id=$(python3 -c "import json; print(json.load(open('notarize.json')).get('id',''))")
+          status=$(python3 -c "import json; print(json.load(open('notarize.json')).get('status',''))")
+          if [ -n "$id" ]; then
+            xcrun notarytool log "$id" --key "$APPLE_API_KEY" --key-id "$APPLE_API_KEY_ID" \
+              --issuer "$APPLE_API_ISSUER" notarize-log.json || true
+          fi
+          [ "$status" = Accepted ] || { echo "::error::notarization status '$status' (see notarize-log.json)"; exit 1; }
+          xcrun stapler staple "$pkg"
+
+      - name: What Gatekeeper will say
+        working-directory: src
+        run: |
+          pkg=$(ls release/OnkoDICOM-*.pkg)
+          pkgutil --check-signature "$pkg"
+          spctl --assess --type install -vv "$pkg"
+          xcrun stapler validate "$pkg"
+
+      - name: Upload the installer and the logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: onkodicom-macos-${{ steps.want.outputs.version }}-${{ steps.want.outputs.sha }}
+          path: |
+            src/release/*.pkg
+            src/release/notarize*.json
+            src/pyinstaller.log
+          if-no-files-found: warn
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          [ -z "${KEYCHAIN:-}" ] || security delete-keychain "$KEYCHAIN" || true
