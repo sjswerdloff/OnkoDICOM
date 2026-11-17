@@ -4,11 +4,18 @@
 # A release is a push to `main` that changes release/macos.env, which names the commit to build:
 #   ONKODICOM_SHA=<40-character commit of sjswerdloff/OnkoDICOM, normally on kindled-main>
 #   ONKODICOM_VERSION=<the version in that commit's pyproject.toml>
+#   ONKODICOM_RELEASE=<the release name, e.g. 0.7.1-sjs1: the tag and the installer's file name>
 # The version is checked against the commit, so a SHA pasted from the wrong place fails before anything is signed.
+# (Upstream does not bump pyproject.toml, so the release name and that version differ.) The app's own version is the
+# release name's leading numbers (0.7.1): Apple accepts only period-separated integers there.
 #
 # Signing and notarization use the same seven secrets as Midst (midst-editor docs/macos-signing.md), set on this
 # repository with tools/setup_signing_secrets.sh: CSC_LINK, CSC_KEY_PASSWORD, CSC_INSTALLER_LINK,
 # CSC_INSTALLER_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER. A release without them fails.
+#
+# When the package job passes, the publish job tags ONKODICOM_SHA as ONKODICOM_RELEASE and makes a GitHub Release under
+# that tag with the notarized .pkg and its SHA256SUMS (as Midst's release.yml does). Only the publish job's token can
+# write, and this workflow runs only on a push to main. Release assets have no storage quota; artifacts are kept 7 days.
 name: macOS release
 
 on:
@@ -28,6 +35,10 @@ jobs:
     if: github.repository == 'sjswerdloff/OnkoDICOM'
     runs-on: macos-15
     timeout-minutes: 150
+    outputs:
+      sha: ${{ steps.want.outputs.sha }}
+      release: ${{ steps.want.outputs.release }}
+      bundle: ${{ steps.want.outputs.bundle }}
     steps:
       - name: Release control (this branch)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,11 +52,37 @@ jobs:
           [ -f "$f" ] || { echo "::error::no $f"; exit 1; }
           sha=$(sed -n 's/^ONKODICOM_SHA=//p' "$f")
           version=$(sed -n 's/^ONKODICOM_VERSION=//p' "$f")
+          release=$(sed -n 's/^ONKODICOM_RELEASE=//p' "$f")
           printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::ONKODICOM_SHA is not a 40-character commit: '$sha'"; exit 1; }
           [ -n "$version" ] || { echo "::error::no ONKODICOM_VERSION in $f"; exit 1; }
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "building OnkoDICOM $version at $sha"
+          printf '%s' "$release" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+.][A-Za-z0-9.]+)?$' \
+            || { echo "::error::ONKODICOM_RELEASE should look like 0.7.1-sjs1: '$release'"; exit 1; }
+          bundle=$(printf '%s' "$release" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          {
+            echo "sha=$sha"
+            echo "version=$version"
+            echo "release=$release"
+            echo "bundle=$bundle"
+          } >> "$GITHUB_OUTPUT"
+          echo "building OnkoDICOM $release (app version $bundle) at $sha, whose pyproject.toml says $version"
+
+      # Before an hour of building and signing: the release name must be free, or already on this very commit.
+      - name: The release name is not taken by other code
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.want.outputs.sha }}
+          RELEASE: ${{ steps.want.outputs.release }}
+        run: |
+          # gh prints an API error on STDOUT, so only a successful lookup counts (Midst release.yml).
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE" --jq .sha 2>/dev/null) || tagged=""
+          if [ -n "$tagged" ] && [ "$tagged" != "$SHA" ]; then
+            echo "::error::tag $RELEASE already marks $tagged, not $SHA. Choose another release name."
+            exit 1
+          fi
+          if gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::a release $RELEASE already exists"
+            exit 1
+          fi
 
       - name: OnkoDICOM at that commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -64,7 +101,7 @@ jobs:
             || { echo "::error::this commit has no packaging/macos scripts (#93 not merged into it)"; exit 1; }
 
       - name: uv, pinned
-        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3 (Node 24)
         with:
           version: "0.13.8"
 
@@ -92,6 +129,18 @@ jobs:
           a=$(lipo -archs dist/OnkoDICOM.app/Contents/MacOS/OnkoDICOM)
           echo "architecture: $a"
           [ "$a" = arm64 ]
+
+      # Before signing, which seals Info.plist.
+      - name: The app's version is the release's
+        working-directory: src
+        env:
+          BUNDLE: ${{ steps.want.outputs.bundle }}
+        run: |
+          plist=dist/OnkoDICOM.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $BUNDLE" "$plist"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleVersion" "$plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUNDLE" "$plist"
+          plutil -p "$plist" | grep -E 'CFBundle(ShortVersionString|Version)"'
 
       # Copied from Midst's package.yml: a keychain made for this job, the two Developer ID identities imported into it,
       # and the notarization key written to a file in RUNNER_TEMP (emptied after every job).
@@ -150,10 +199,10 @@ jobs:
       - name: Build and sign the installer
         working-directory: src
         env:
-          VERSION: ${{ steps.want.outputs.version }}
+          RELEASE: ${{ steps.want.outputs.release }}
         run: |
           mkdir -p release
-          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$VERSION-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
+          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$RELEASE-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
 
       # One submission: Apple checks everything nested in the .pkg. The log is kept, because a rejection names the files.
       - name: Notarize and staple
@@ -184,14 +233,69 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: onkodicom-macos-${{ steps.want.outputs.version }}-${{ steps.want.outputs.sha }}
+          name: onkodicom-macos-${{ steps.want.outputs.release }}-${{ steps.want.outputs.sha }}
           path: |
             src/release/*.pkg
             src/release/notarize*.json
             src/pyinstaller.log
           if-no-files-found: warn
+          # For checking a run only; the installer people download is the GitHub Release asset (below).
+          retention-days: 7
 
       - name: Remove the signing keychain
         if: always()
         run: |
           [ -z "${KEYCHAIN:-}" ] || security delete-keychain "$KEYCHAIN" || true
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # the tag and the release; nothing else in this workflow can write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.package.outputs.sha }}
+      RELEASE: ${{ needs.package.outputs.release }}
+      BUNDLE: ${{ needs.package.outputs.bundle }}
+    steps:
+      - name: The notarized installer from the package job
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: onkodicom-macos-${{ needs.package.outputs.release }}-${{ needs.package.outputs.sha }}
+          path: candidate
+
+      - name: Checksums and release notes
+        run: |
+          mkdir release
+          mv candidate/release/*.pkg release/
+          ( cd release && sha256sum -- *.pkg > SHA256SUMS && cat SHA256SUMS )
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          cat > release-notes.md <<EOF
+          OnkoDICOM $RELEASE for macOS on Apple silicon (arm64), macOS 15 or later. The app's version is $BUNDLE.
+
+          Built by [this run]($run_url) from \`$SHA\`. The installer is signed with a Developer ID, notarized and stapled; check the download against \`SHA256SUMS\`.
+
+          plastimatch 1.10.1-itk5 is bundled inside the app. It links FFTW (GPL-2.0-or-later); its source, and the source offer for the bundled libraries, are at https://gitlab.com/sjswerdloff/plastimatch/-/releases/v1.10.1-itk5
+          EOF
+          cat release-notes.md
+
+      - name: Tag the commit
+        run: |
+          tagged=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$RELEASE" --jq .sha 2>/dev/null) || tagged=""
+          if [ "$tagged" = "$SHA" ]; then
+            echo "$RELEASE already tags $SHA"
+            exit 0
+          fi
+          [ -z "$tagged" ] || { echo "::error::tag $RELEASE marks $tagged, not $SHA"; exit 1; }
+          obj=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$RELEASE" -f object="$SHA" -f type=commit \
+            -f message="OnkoDICOM $RELEASE (macOS), built and released by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .sha)
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$RELEASE" -f sha="$obj" > /dev/null
+          echo "tagged $SHA as $RELEASE"
+
+      - name: Publish the release
+        run: |
+          gh release create "$RELEASE" release/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "OnkoDICOM $RELEASE (macOS)" --notes-file release-notes.md
+          url=$(gh release view "$RELEASE" --repo "$GITHUB_REPOSITORY" --json url --jq .url)
+          { echo "### Released OnkoDICOM $RELEASE"; echo "$url"; echo; echo '```'; cat release/SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          echo "$url"
