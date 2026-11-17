@@ -12,6 +12,10 @@
 # Signing and notarization use the same seven secrets as Midst (midst-editor docs/macos-signing.md), set on this
 # repository with tools/setup_signing_secrets.sh: CSC_LINK, CSC_KEY_PASSWORD, CSC_INSTALLER_LINK,
 # CSC_INSTALLER_KEY_PASSWORD, APPLE_API_KEY, APPLE_API_KEY_ID, APPLE_API_ISSUER. A release without them fails.
+#
+# Publishing is by hand, so this job's token stays read-only: after a run passes, the tag (ONKODICOM_RELEASE) goes on
+# ONKODICOM_SHA, and the notarized .pkg is downloaded from the run's artifact and attached to a GitHub Release under
+# that tag (gh release create). Release assets have no storage quota; artifacts are kept 7 days.
 name: macOS release
 
 on:
@@ -213,6 +217,8 @@ jobs:
             src/release/notarize*.json
             src/pyinstaller.log
           if-no-files-found: warn
+          # For checking a run only; the installer people download is the GitHub Release asset (below).
+          retention-days: 7
 
       - name: Remove the signing keychain
         if: always()
