@@ -4,7 +4,10 @@
 # A release is a push to `main` that changes release/macos.env, which names the commit to build:
 #   ONKODICOM_SHA=<40-character commit of sjswerdloff/OnkoDICOM, normally on kindled-main>
 #   ONKODICOM_VERSION=<the version in that commit's pyproject.toml>
+#   ONKODICOM_RELEASE=<the release name, e.g. 0.7.1-sjs1: the tag and the installer's file name>
 # The version is checked against the commit, so a SHA pasted from the wrong place fails before anything is signed.
+# (Upstream does not bump pyproject.toml, so the release name and that version differ.) The app's own version is the
+# release name's leading numbers (0.7.1): Apple accepts only period-separated integers there.
 #
 # Signing and notarization use the same seven secrets as Midst (midst-editor docs/macos-signing.md), set on this
 # repository with tools/setup_signing_secrets.sh: CSC_LINK, CSC_KEY_PASSWORD, CSC_INSTALLER_LINK,
@@ -41,11 +44,19 @@ jobs:
           [ -f "$f" ] || { echo "::error::no $f"; exit 1; }
           sha=$(sed -n 's/^ONKODICOM_SHA=//p' "$f")
           version=$(sed -n 's/^ONKODICOM_VERSION=//p' "$f")
+          release=$(sed -n 's/^ONKODICOM_RELEASE=//p' "$f")
           printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$' || { echo "::error::ONKODICOM_SHA is not a 40-character commit: '$sha'"; exit 1; }
           [ -n "$version" ] || { echo "::error::no ONKODICOM_VERSION in $f"; exit 1; }
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "building OnkoDICOM $version at $sha"
+          printf '%s' "$release" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+.][A-Za-z0-9.]+)?$' \
+            || { echo "::error::ONKODICOM_RELEASE should look like 0.7.1-sjs1: '$release'"; exit 1; }
+          bundle=$(printf '%s' "$release" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+          {
+            echo "sha=$sha"
+            echo "version=$version"
+            echo "release=$release"
+            echo "bundle=$bundle"
+          } >> "$GITHUB_OUTPUT"
+          echo "building OnkoDICOM $release (app version $bundle) at $sha, whose pyproject.toml says $version"
 
       - name: OnkoDICOM at that commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,6 +103,18 @@ jobs:
           a=$(lipo -archs dist/OnkoDICOM.app/Contents/MacOS/OnkoDICOM)
           echo "architecture: $a"
           [ "$a" = arm64 ]
+
+      # Before signing, which seals Info.plist.
+      - name: The app's version is the release's
+        working-directory: src
+        env:
+          BUNDLE: ${{ steps.want.outputs.bundle }}
+        run: |
+          plist=dist/OnkoDICOM.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $BUNDLE" "$plist"
+          /usr/libexec/PlistBuddy -c "Delete :CFBundleVersion" "$plist" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Add :CFBundleVersion string $BUNDLE" "$plist"
+          plutil -p "$plist" | grep -E 'CFBundle(ShortVersionString|Version)"'
 
       # Copied from Midst's package.yml: a keychain made for this job, the two Developer ID identities imported into it,
       # and the notarization key written to a file in RUNNER_TEMP (emptied after every job).
@@ -150,10 +173,10 @@ jobs:
       - name: Build and sign the installer
         working-directory: src
         env:
-          VERSION: ${{ steps.want.outputs.version }}
+          RELEASE: ${{ steps.want.outputs.release }}
         run: |
           mkdir -p release
-          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$VERSION-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
+          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$RELEASE-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
 
       # One submission: Apple checks everything nested in the .pkg. The log is kept, because a rejection names the files.
       - name: Notarize and staple
@@ -184,7 +207,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: onkodicom-macos-${{ steps.want.outputs.version }}-${{ steps.want.outputs.sha }}
+          name: onkodicom-macos-${{ steps.want.outputs.release }}-${{ steps.want.outputs.sha }}
           path: |
             src/release/*.pkg
             src/release/notarize*.json
