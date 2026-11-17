@@ -35,11 +35,38 @@ jobs:
     if: github.repository == 'sjswerdloff/OnkoDICOM'
     runs-on: macos-15
     timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: write # only to delete the Actions caches of closed PRs (below)
     outputs:
       sha: ${{ steps.want.outputs.sha }}
       release: ${{ steps.want.outputs.release }}
       bundle: ${{ steps.want.outputs.bundle }}
     steps:
+      # GitHub keeps 10 GB of Actions cache per repository and evicts the least recently used. A PR's caches are usable
+      # only on that PR, and upstream's pythonapp.yml leaves about 10 GB of Poetry caches on every PR into main, which
+      # evicted this workflow's uv and plastimatch caches (17 Nov). So caches of closed PRs go before anything is built.
+      - name: Delete the caches of closed PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+            --jq '.actions_caches[] | "\(.id) \(.ref) \(.size_in_bytes)"' > caches.txt
+          echo "caches before: $(wc -l < caches.txt | tr -d ' ')"
+          freed=0
+          while read -r id ref size; do
+            n=$(printf '%s' "$ref" | sed -n 's#^refs/pull/\([0-9]*\)/merge$#\1#p')
+            [ -n "$n" ] || continue
+            state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$n" --jq .state < /dev/null) \
+              || { echo "::warning::could not read PR #$n; its cache $id is kept"; continue; }
+            [ "$state" = closed ] || continue
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" < /dev/null \
+              || { echo "::warning::could not delete cache $id of closed PR #$n"; continue; }
+            echo "deleted cache $id of closed PR #$n ($((size / 1048576)) MB)"
+            freed=$((freed + size))
+          done < caches.txt
+          echo "freed $((freed / 1048576)) MB"
+
       - name: Release control (this branch)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -104,6 +131,12 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3 (Node 24)
         with:
           version: "0.13.8"
+          # Every downloaded wheel is kept (v5 pruned the cache to source builds, ~100 MB of a multi-GB set), and the
+          # managed Python too. The key follows src/uv.lock alone, so only a lock change starts a fresh cache.
+          enable-cache: true
+          prune-cache: false
+          cache-python: true
+          cache-dependency-glob: src/uv.lock
 
       # The spec keeps the tarball as build/plastimatch/<sha256>.tar.gz and checks it every build; caching that file by
       # the same SHA-256 means one download per plastimatch version.
