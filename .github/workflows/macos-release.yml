@@ -6,6 +6,7 @@
 #   ONKODICOM_VERSION=<the version in that commit's pyproject.toml>
 #   ONKODICOM_RELEASE=<the release name, e.g. 0.7.1-sjs1: the tag and the installer's file name>
 # The version is checked against the commit, so a SHA pasted from the wrong place fails before anything is signed.
+# The signing and packaging scripts (packaging/macos/) also live only here, and run from this branch on the built commit.
 # (Upstream does not bump pyproject.toml, so the release name and that version differ.) The app's own version is the
 # release name's leading numbers (0.7.1): Apple accepts only period-separated integers there.
 #
@@ -124,8 +125,6 @@ jobs:
         run: |
           got=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           [ "$got" = "$WANT" ] || { echo "::error::pyproject.toml says $got, release/macos.env says $WANT"; exit 1; }
-          [ -x packaging/macos/sign_app.sh ] && [ -x packaging/macos/build_pkg.sh ] \
-            || { echo "::error::this commit has no packaging/macos scripts (#93 not merged into it)"; exit 1; }
 
       - name: uv, pinned
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3 (Node 24)
@@ -227,7 +226,7 @@ jobs:
 
       - name: Sign the app (hardened runtime)
         working-directory: src
-        run: packaging/macos/sign_app.sh dist/OnkoDICOM.app "$APP_IDENTITY" "$KEYCHAIN"
+        run: ../control/packaging/macos/sign_app.sh dist/OnkoDICOM.app "$APP_IDENTITY" "$KEYCHAIN"
 
       - name: Build and sign the installer
         working-directory: src
@@ -235,7 +234,7 @@ jobs:
           RELEASE: ${{ steps.want.outputs.release }}
         run: |
           mkdir -p release
-          packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$RELEASE-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
+          ../control/packaging/macos/build_pkg.sh dist/OnkoDICOM.app "release/OnkoDICOM-$RELEASE-macos-arm64.pkg" "$PKG_IDENTITY" "$KEYCHAIN"
 
       # One submission: Apple checks everything nested in the .pkg. The log is kept, because a rejection names the files.
       - name: Notarize and staple
